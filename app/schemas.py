@@ -383,6 +383,75 @@ class AugmentationPlanOut(BaseModel):
     )
 
 
+class PanelSelectionGroupIn(BaseModel):
+    """一个目标组：求解时从中恰选一条引物的候选集合。"""
+
+    primer_names: list[str] = Field(
+        ...,
+        min_length=2,
+        max_length=5,
+        description=(
+            "本组候选引物名（2～5 个，须均为批次内引物；"
+            "组内与跨组均不可重复，重复归组返回 422）"
+        ),
+    )
+
+    @field_validator("primer_names")
+    @classmethod
+    def _primer_names(cls, values: list[str]) -> list[str]:
+        normalized: list[str] = []
+        for value in values:
+            name = value.strip()
+            if not name:
+                raise ValueError("引物名称不能为空")
+            if len(name) > 100:
+                raise ValueError("引物名称最长 100 字符")
+            normalized.append(name)
+        return normalized
+
+
+class PanelSelectionRequest(BaseModel):
+    groups: list[PanelSelectionGroupIn] = Field(
+        ...,
+        min_length=2,
+        max_length=8,
+        description=(
+            "2～8 个目标组（按请求顺序）；从每组恰选一条引物，"
+            "同分决胜也按此顺序比较各组入选引物的批次位置"
+        ),
+    )
+
+
+class PanelSelectionSelectedOut(BaseModel):
+    group_index: int = Field(description="目标组在请求中的序号（0 起）")
+    position: int = Field(description="入选引物在批次中的位置（0 起）")
+    name: str
+    sequence: str
+
+
+class PanelSelectionOut(BaseModel):
+    batch_id: str
+    group_count: int = Field(description="目标组数（2～8）")
+    selected_count: int = Field(description="入选引物数（恒等于 group_count）")
+    combination_count: int = Field(
+        description="搜索组合数（各组候选数之积，上限 390625）"
+    )
+    selected_pair_count: int = Field(
+        description="入选引物集合的配对总数（自二聚体 + 两两异二聚体）"
+    )
+    high_pair_count: int = Field(description="目标值①：入选集合内 high 配对数")
+    medium_pair_count: int = Field(description="目标值②：入选集合内 medium 配对数")
+    max_three_prime_run: int = Field(
+        description="目标值③：入选集合内最大 3′端连续互补长度"
+    )
+    selected: list[PanelSelectionSelectedOut] = Field(
+        description="各组入选引物（按组请求顺序）"
+    )
+    risky_pairs: list[PairOut] = Field(
+        description="入选集合内全部 high/medium 配对（按 pair_index 升序）"
+    )
+
+
 class ThresholdMapRequest(BaseModel):
     continuous_start: int = Field(
         ...,

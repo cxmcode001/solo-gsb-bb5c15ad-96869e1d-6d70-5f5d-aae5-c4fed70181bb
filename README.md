@@ -14,6 +14,12 @@ SQLite，支持事后查询。对已保存批次还可通过 `POST /api/batches/
 引物复用现有配对算法计算自二聚体、与原批次及候选两两异二聚体，在
 high/medium 冲突图上用**确定性分支限界**精确选出不超过接纳上限的最大无冲突
 候选集合（不落库）；
+通过 `POST /api/batches/{id}/panel-selection` 为已保存批次**联合选择多重
+PCR 面板**：请求给出 2～8 个目标组（每组 2～5 条批次内引物名、跨组不重复），
+只读取已保存配对的**风险等级与 3′端连续互补长度**两个标量（不重算对齐、不写库），
+用**确定性分支限界**从每组恰选一条，在入选引物的自二聚体与两两异二聚体上
+依次最小化 high 配对数、medium 配对数、最大 3′端连续互补长度，同分按组请求
+顺序的批次位置元组取唯一解；
 通过 `POST /api/batches/{id}/threshold-map` 只读取已保存配对的两个标量指标
 （最长连续互补、3′端连续互补），用**二维差分**在请求的阈值网格上聚合出每个
 阈值组合下的 high/medium/low 配对数量（不重算对齐、不修改批次）；
@@ -53,6 +59,7 @@ docker compose up --build -d
 | 引物分池 | `POST http://localhost:8000/api/batches/{id}/pool-plan` |
 | 替换候选排名 | `POST http://localhost:8000/api/batches/{id}/replacement-ranking` |
 | 候选增量筛选 | `POST http://localhost:8000/api/batches/{id}/augmentation-plan` |
+| 多重 PCR 面板联合选择 | `POST http://localhost:8000/api/batches/{id}/panel-selection` |
 | 阈值扫描地图 | `POST http://localhost:8000/api/batches/{id}/threshold-map` |
 | 冲突修复计划 | `POST http://localhost:8000/api/batches/{id}/conflict-repair-plan` |
 | 冲突图割点与桥 | `POST http://localhost:8000/api/batches/{id}/conflict-fragility-map` |
@@ -410,6 +417,75 @@ curl -s -X POST http://localhost:8000/api/batches/f98cdd27-.../augmentation-plan
 * 被自身自二聚体淘汰时 `counterpart_kind: "self"`；与入选候选冲突时
   `counterpart_kind: "candidate"`（只会列出最终入选的候选；与其他落选候选的
   冲突不构成阻断）。
+
+### `POST /api/batches/{id}/panel-selection` — 多重 PCR 面板联合选择（分支限界精确解，不重算对齐）
+
+为**已保存批次**联合选择一组多重 PCR 面板：请求给出 **2～8 个目标组**，每组列出
+**2～5 条批次内引物名**（组内与跨组均不可重复），服务从**每组恰选一条**引物，
+使面板整体的已保存二聚体风险最小：
+
+* **只读已保存结果**：仅使用批次已落库配对的两个标量——风险等级
+  （`high`/`medium`/`low`）与 3′端连续互补长度；**不重算任何对齐、不写库**；
+* **目标（按字典序依次最小化）**：对面板入选引物的全部相关配对——每条入选
+  引物的**自二聚体** + 入选引物**两两异二聚体**，共 `k(k+1)/2` 对（k 为组数）——
+  依次最小化 ① `high` 配对数、② `medium` 配对数、③ 最大 3′端连续互补长度；
+* **确定性分支限界精确解**：按组请求顺序、组内按批次位置升序深度优先枚举；
+  三个目标分量都随配对增加而单调不减，部分解不严格优于当前最优完成解即整棵
+  子树剪枝；同分时按**组请求顺序排列的入选引物批次位置元组**取字典序最小的
+  唯一解，全序无并列，相同输入结果稳定可复现；
+* **组合数上限**：各组候选数之积 ≤ **390625**（= 5⁸，即 8 组 × 5 候选的结构
+  上限），超限返回 `422`；
+* 批次不存在返回 `404`；引物名不存在于批次、重复归组（组内或跨组）、组数
+  非 2～8、组内候选数非 2～5、名称为空返回 `422`。
+
+```bash
+curl -s -X POST http://localhost:8000/api/batches/f98cdd27-.../panel-selection \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "groups": [
+      {"primer_names": ["F", "H"]},
+      {"primer_names": ["R", "A"]}
+    ]
+  }'
+```
+
+请求字段：
+
+| 字段 | 说明 |
+| --- | --- |
+| `groups` | 2～8 个目标组，顺序即求解与同分决胜的顺序 |
+| `groups[].primer_names` | 本组 2～5 条候选引物名（去首尾空白后比较），须均为批次内引物；组内与跨组均不可重复 |
+
+返回示例（批次 `F/R/H/A`，阈值 ct=4、tt=3；`F-R` 为 high、`H` 自二聚体为 high，
+最优解 `F+A` 的全部配对均为 low）：
+
+```json
+{
+  "batch_id": "f98cdd27-...",
+  "group_count": 2,
+  "selected_count": 2,
+  "combination_count": 4,
+  "selected_pair_count": 3,
+  "high_pair_count": 0,
+  "medium_pair_count": 0,
+  "max_three_prime_run": 1,
+  "selected": [
+    {"group_index": 0, "position": 0, "name": "F", "sequence": "GGGGGAAAAA"},
+    {"group_index": 1, "position": 3, "name": "A", "sequence": "ATACACGTCA"}
+  ],
+  "risky_pairs": []
+}
+```
+
+* `selected` 按组请求顺序给出各组入选引物（`group_index` 为组在请求中的序号，
+  `position` 为批次位置）；`selected_count` 恒等于 `group_count`；
+* `combination_count` 为各组候选数之积（本次搜索的组合空间大小）；
+  `selected_pair_count` 恒为 `k(k+1)/2`，即目标值统计的配对总数；
+* `high_pair_count` / `medium_pair_count` / `max_three_prime_run` 即最优解的
+  三维目标值，统计范围是入选引物的自二聚体与两两异二聚体；
+* `risky_pairs` 列出入选集合内**全部** `high`/`medium` 配对（含自二聚体，
+  按 `pair_index` 升序），每个配对与 `GET /api/batches/{id}` 的配对结果字段
+  **完全同构**（含对齐可视化）；全部配对为 `low` 时为空列表。
 
 ### `POST /api/batches/{id}/threshold-map` — 阈值扫描地图
 

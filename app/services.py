@@ -5,11 +5,12 @@ from __future__ import annotations
 import json
 import uuid
 
-from . import db
+from . import config, db
 from .augmentation import maximum_independent_set
 from .compare import PairDiff, compare_pair_risks, pair_key
 from .dimer import PairResult, analyze_pair
 from .fragility import find_fragility
+from .panel import select_panel
 from .pooling import build_pool_plan
 from .ranking import non_dominated_layers
 from .repair import InfeasibleRepair, minimum_cost_removal
@@ -538,6 +539,127 @@ def plan_batch_augmentation(
         "rejected_count": len(rejected_out),
         "selected": selected_out,
         "rejected": rejected_out,
+    }
+
+
+def plan_batch_panel_selection(
+    *,
+    batch_id: str,
+    groups: list[list[str]],
+) -> dict | None:
+    """为已保存批次联合选择多重 PCR 面板（纯读，不重算对齐、不写库）。
+
+    请求给出 2～8 个目标组（每组 2～5 条批次内引物名，组内与跨组均不可
+    重复），从每组恰选一条引物构成面板。仅使用已落库配对的两个标量——
+    风险等级与 3′端连续互补长度——在“入选引物自二聚体 + 入选引物两两
+    异二聚体”上用确定性分支限界精确求解：依次最小化 high 配对数、
+    medium 配对数、最大 3′端连续互补长度；同分按组请求顺序排列的入选
+    引物批次位置元组取字典序最小的唯一解。
+
+    批次不存在返回 None（路由层转 404）；名称不存在于批次、重复归组或
+    搜索组合数（各组候选数之积）超过上限抛出 ValueError（路由层转 422）。
+    groups 为按请求顺序排列的各组候选引物名（名称合法性由请求模型保证）。
+    """
+    with db.get_conn() as conn:
+        batch = db.get_batch(conn, batch_id)
+        if batch is None:
+            return None
+        primers = db.get_primers(conn, batch_id)
+        pairs = db.get_pairs(conn, batch_id, risky_only=False)
+
+    # 批次内引物名称唯一（入库时已保证）
+    position_by_name = {row["name"]: row["position"] for row in primers}
+    primer_by_position = {row["position"]: row for row in primers}
+
+    # 重复归组：名称在任一组内重复或跨组重复
+    seen: set[str] = set()
+    duplicates: list[str] = []
+    for names in groups:
+        for name in names:
+            if name in seen:
+                duplicates.append(name)
+            seen.add(name)
+    if duplicates:
+        raise ValueError(
+            "引物重复归组: " + ", ".join(sorted(set(duplicates)))
+        )
+
+    unknown = sorted(
+        {name for names in groups for name in names} - set(position_by_name)
+    )
+    if unknown:
+        raise ValueError(
+            "批次内不存在名为 "
+            + ", ".join(repr(name) for name in unknown)
+            + " 的引物"
+        )
+
+    combination_count = 1
+    for names in groups:
+        combination_count *= len(names)
+    if combination_count > config.PANEL_SELECTION_MAX_COMBINATIONS:
+        raise ValueError(
+            f"搜索组合数 {combination_count} 超过上限 "
+            f"{config.PANEL_SELECTION_MAX_COMBINATIONS}"
+        )
+
+    # 已保存配对的 (风险等级, 3′端连续互补长度)，键为 (小位置, 大位置)；
+    # 自二聚体行的 top/bottom 同名，键为 (position, position)
+    metrics: dict[tuple[int, int], tuple[str, int]] = {}
+    for row in pairs:
+        pos_a = position_by_name[row["name_top"]]
+        pos_b = position_by_name[row["name_bottom"]]
+        key = (pos_a, pos_b) if pos_a <= pos_b else (pos_b, pos_a)
+        metrics[key] = (row["risk_level"], row["terminal_run"])
+
+    selection = select_panel(
+        [[position_by_name[name] for name in names] for names in groups],
+        metrics,
+    )
+    selected_set = set(selection.selected)
+
+    # 入选集合全部配对（自二聚体 + 两两异二聚体）上汇总目标值并收集
+    # high/medium 明细；pairs 行已按 pair_index 升序
+    high_count = 0
+    medium_count = 0
+    max_three_prime_run = 0
+    risky_pairs: list[dict] = []
+    for row in pairs:
+        pos_a = position_by_name[row["name_top"]]
+        pos_b = position_by_name[row["name_bottom"]]
+        if pos_a not in selected_set or pos_b not in selected_set:
+            continue
+        if row["terminal_run"] > max_three_prime_run:
+            max_three_prime_run = row["terminal_run"]
+        if row["risk_level"] == "high":
+            high_count += 1
+        elif row["risk_level"] == "medium":
+            medium_count += 1
+        else:
+            continue
+        risky_pairs.append(db.serialize_pair(row))
+
+    selected_out = [
+        {
+            "group_index": group_index,
+            "position": position,
+            "name": primer_by_position[position]["name"],
+            "sequence": primer_by_position[position]["sequence"],
+        }
+        for group_index, position in enumerate(selection.selected)
+    ]
+
+    return {
+        "batch_id": batch_id,
+        "group_count": len(groups),
+        "selected_count": len(selected_out),
+        "combination_count": combination_count,
+        "selected_pair_count": len(selected_out) * (len(selected_out) + 1) // 2,
+        "high_pair_count": high_count,
+        "medium_pair_count": medium_count,
+        "max_three_prime_run": max_three_prime_run,
+        "selected": selected_out,
+        "risky_pairs": risky_pairs,
     }
 
 

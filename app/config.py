@@ -26,3 +26,8 @@ RESET_ON_START: bool = _env_bool("PRIMER_DB_RESET", "0")
 # 阈值起止范围 1～200，单次请求的阈值组合数不超过 40000
 THRESHOLD_MAP_MAX_THRESHOLD: int = 200
 THRESHOLD_MAP_MAX_CELLS: int = 40000
+
+# 面板联合选择接口的固定约束（接口规格，非部署可调）：
+# 2～8 个目标组、每组 2～5 条候选引物，搜索组合数（各组候选数之积）
+# 不超过 390625（= 5^8，即 8 组 × 5 候选的结构上限）
+PANEL_SELECTION_MAX_COMBINATIONS: int = 390625
