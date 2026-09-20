@@ -32,7 +32,12 @@ low-link 一次遍历**识别全部割点引物（含移除后的连通分量数
 用一组**统一阈值**直接读取各批次配对已保存的两个互补长度**重判风险（不重算对齐）**，
 按引物名称生成稳定配对键，把每个配对键跨批次的 present/absent 序列**压缩为最大连续
 片段**（同名引物序列变化在片段边界标记），仅返回发生风险、存在性或序列变化的轨迹，
-并汇总各相邻批次的升降、引入、消失数量（全程只读）。
+并汇总各相邻批次的升降、引入、消失数量（全程只读）；
+通过 `POST /api/batches/{id}/panel-selection` 提交 2～8 个目标组（每组 2～5 个
+批次内引物名、跨组不重复），基于**已保存**的自二聚体与异二聚体结果用**确定性分支
+限界**从每组恰选一条组成多重 PCR 面板，依次最小化 high 配对数、medium 配对数、
+最大 3′连续互补长度，同分按各组请求顺序的批次位置元组取唯一解（不重算对齐、
+不写库）。
 
 ---
 
@@ -56,6 +61,7 @@ docker compose up --build -d
 | 阈值扫描地图 | `POST http://localhost:8000/api/batches/{id}/threshold-map` |
 | 冲突修复计划 | `POST http://localhost:8000/api/batches/{id}/conflict-repair-plan` |
 | 冲突图割点与桥 | `POST http://localhost:8000/api/batches/{id}/conflict-fragility-map` |
+| 多重 PCR 面板联合选择 | `POST http://localhost:8000/api/batches/{id}/panel-selection` |
 | 批次风险对比 | `GET http://localhost:8000/api/batches/{base_id}/compare/{target_id}` |
 | 跨批次风险轨迹 | `POST http://localhost:8000/api/batch-series/risk-trajectories` |
 
@@ -680,6 +686,80 @@ curl -s -X POST http://localhost:8000/api/batches/f98cdd27-.../conflict-fragilit
 * 两点分量（仅一条边的分量）的边必为桥，但其端点不是割点（移除一端后另一端
   自成分量，分量数不变）。
 
+### `POST /api/batches/{id}/panel-selection` — 多重 PCR 面板联合选择（分支限界精确解，不重算对齐）
+
+对**已保存批次**提交 **2～8 个目标组**（每组 **2～5 个批次内引物名**，组内有序、
+跨组不可重复），服务从每组恰选一条引物组成多重 PCR 面板，使面板的二聚体风险
+按字典序最小：
+
+* **面板配对**：入选引物的**自二聚体**与入选引物两两间的**异二聚体**；直接读取
+  批次已保存的风险等级与 3′连续互补长度，**不重算对齐、不写库**（纯读操作）；
+* **三元目标（依次最小化）**：
+  1. `high_pair_count` —— 面板内 `high` 配对数；
+  2. `medium_pair_count` —— 面板内 `medium` 配对数；
+  3. `max_three_prime_run` —— 面板全部配对（含 `low`）的最大 3′连续互补长度；
+* **确定性分支限界**：按组序深度优先、组内按候选批次位置升序枚举，以各组候选
+  自二聚体的最小 high/medium 计数与最小 3′连续长度作剩余下界剪枝；目标值相同的
+  解按**各组请求顺序的批次位置元组**取字典序最小者，全序无并列，结果唯一、
+  稳定可复现；
+* **搜索组合数上限**：各组规模之积 ≤ **390625**（= 5⁸，即 8 组 × 5 条的上界），
+  超限返回 `422`；
+* 返回入选引物（`selected`，按组序）、三元目标值（`objectives`）与面板内全部
+  `high`/`medium` 配对（`pairs`，按 `pair_index` 升序，与 `GET /api/batches/{id}`
+  的配对结果字段完全同构）。
+
+```bash
+curl -s -X POST http://localhost:8000/api/batches/f98cdd27-.../panel-selection \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "groups": [
+      {"primer_names": ["F", "H"]},
+      {"primer_names": ["R", "M2"]}
+    ]
+  }'
+```
+
+请求字段：
+
+| 字段 | 说明 |
+| --- | --- |
+| `groups` | 2～8 个目标组，顺序即同分决胜时的组序 |
+| `groups[].primer_names` | 2～5 个批次内引物名称（去首尾空白后比较），组内/跨组均不可重复 |
+
+返回示例（F-M2 为 medium 配对，其余组合均含 high）：
+
+```json
+{
+  "batch_id": "f98cdd27-...",
+  "group_count": 2,
+  "objectives": {
+    "high_pair_count": 0,
+    "medium_pair_count": 1,
+    "max_three_prime_run": 0
+  },
+  "selected": [
+    {"group_index": 0, "position": 0, "name": "F"},
+    {"group_index": 1, "position": 7, "name": "M2"}
+  ],
+  "pairs": [
+    {
+      "pair_index": 16,
+      "name_top": "F", "name_bottom": "M2", "is_self_dimer": false,
+      "risk_level": "medium",
+      "continuous_complementary_length": 4,
+      "three_prime_run_length": 0,
+      "...": "与批次配对结果同构"
+    }
+  ]
+}
+```
+
+* `selected` 长度恒等于 `group_count`，每组恰一条；`position` 为批次位置（0 起）；
+* `objectives.high_pair_count` / `medium_pair_count` 恒等于 `pairs` 中对应风险
+  等级的配对数；`pairs` 为空表示面板内无 `high`/`medium` 配对；
+* 批次不存在返回 `404`；引物名不存在于批次、组内/跨组重复归组、组数非 2～8、
+  组规模非 2～5、名称为空或搜索组合数超过 390625 返回 `422`。
+
 ### `GET /api/batches/{base_id}/compare/{target_id}` — 批次风险对比
 
 按引物**名称**构造稳定配对键，对比 base → target 两个已保存批次的配对风险：
@@ -967,11 +1047,12 @@ app/
   repair.py     # 批次内含自环冲突图上的确定性分支限界（最小代价顶点覆盖/移除集）
   ranking.py    # 替换候选的非支配分层（Pareto front，越小越优）
   threshold_map.py  # 阈值扫描地图的二维差分（imos）区间累加聚合
+  panel.py      # 多重 PCR 面板联合选择的确定性分支限界（分组恰选一条，三元目标字典序）
   compare.py    # 批次间稳定配对键构造与风险升降分类（escalated 等四类）
   trajectory.py # 跨批次 present/absent 序列的最大连续片段压缩与相邻批次变化汇总
   schemas.py    # Pydantic 模型与输入校验
   db.py         # SQLite 建表、写入、查询
-  services.py   # 批次计算编排（N 自二聚体 + N(N-1)/2 异二聚体）、分池、替换排名、候选增量筛选、冲突修复、阈值地图、批次对比与跨批次轨迹编排
+  services.py   # 批次计算编排（N 自二聚体 + N(N-1)/2 异二聚体）、分池、替换排名、候选增量筛选、冲突修复、阈值地图、面板选择、批次对比与跨批次轨迹编排
   main.py       # FastAPI 路由
   cli.py        # initdb 命令
 tests/          # pytest 算法与 API 测试

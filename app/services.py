@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import uuid
 
-from . import db
+from . import config, db
 from .augmentation import maximum_independent_set
 from .compare import PairDiff, compare_pair_risks, pair_key
 from .dimer import PairResult, analyze_pair
 from .fragility import find_fragility
+from .panel import select_panel
 from .pooling import build_pool_plan
 from .ranking import non_dominated_layers
 from .repair import InfeasibleRepair, minimum_cost_removal
@@ -1048,4 +1050,102 @@ def build_batch_series_risk_trajectories(
         "trajectory_count": len(trajectories_out),
         "transitions": transitions,
         "trajectories": trajectories_out,
+    }
+
+
+def plan_batch_panel_selection(
+    *,
+    batch_id: str,
+    groups: list[list[str]],
+) -> dict | None:
+    """为已保存批次联合选择多重 PCR 面板（纯读，不重算对齐、不写库）。
+
+    每组恰选一条引物组成面板；面板配对为入选引物的自二聚体与入选引物
+    两两间的异二聚体，直接读取已落库的风险等级与 3′连续互补长度，用
+    确定性分支限界依次最小化 high 配对数、medium 配对数、最大 3′连续
+    互补长度；同分按各组请求顺序的批次位置元组取字典序最小解。
+
+    批次不存在返回 None（路由层转 404）；引物名称不存在于批次或搜索
+    组合数超限抛出 ValueError（路由层转 422）。groups 为各组引物名称
+    列表，组数、组规模与跨组唯一性由请求模型保证。
+    """
+    with db.get_conn() as conn:
+        batch = db.get_batch(conn, batch_id)
+        if batch is None:
+            return None
+        primers = db.get_primers(conn, batch_id)
+        pairs = db.get_pairs(conn, batch_id, risky_only=False)
+
+    # 批次内引物名称唯一（入库时已保证）
+    position_by_name = {row["name"]: row["position"] for row in primers}
+    name_by_position = {pos: name for name, pos in position_by_name.items()}
+
+    unknown = sorted(
+        {name for group in groups for name in group} - set(position_by_name)
+    )
+    if unknown:
+        raise ValueError("批次内不存在这些引物名称: " + ", ".join(unknown))
+
+    candidate_positions = {
+        position_by_name[name] for group in groups for name in group
+    }
+
+    # 只收集候选顶点间的已保存配对：自二聚体键为 (v, v)，异二聚体键为
+    # 无序位置对（小者在前）；pair_rows 供响应回传完整配对明细
+    pair_metrics: dict[tuple[int, int], tuple[str, int]] = {}
+    pair_rows: dict[tuple[int, int], sqlite3.Row] = {}
+    for row in pairs:
+        pos_a = position_by_name[row["name_top"]]
+        pos_b = position_by_name[row["name_bottom"]]
+        if (
+            pos_a not in candidate_positions
+            or pos_b not in candidate_positions
+        ):
+            continue
+        key = (pos_a, pos_b) if pos_a <= pos_b else (pos_b, pos_a)
+        pair_metrics[key] = (row["risk_level"], row["terminal_run"])
+        pair_rows[key] = row
+
+    # 组内候选按批次位置升序：分支限界的枚举顺序即位置字典序
+    ordered_groups = [
+        sorted(position_by_name[name] for name in group) for group in groups
+    ]
+
+    solution = select_panel(
+        ordered_groups,
+        pair_metrics,
+        max_combinations=config.PANEL_SELECTION_MAX_COMBINATIONS,
+    )
+    high_count, medium_count, max_three = solution.objectives
+    selected = solution.selection
+
+    # 面板内全部配对键：入选引物自二聚体 + 两两异二聚体
+    panel_keys: list[tuple[int, int]] = []
+    for i, pos in enumerate(selected):
+        panel_keys.append((pos, pos))
+        for other in selected[i + 1:]:
+            panel_keys.append((min(pos, other), max(pos, other)))
+
+    risky_rows = sorted(
+        (pair_rows[key] for key in panel_keys if pair_metrics[key][0] != "low"),
+        key=lambda row: row["pair_index"],
+    )
+
+    return {
+        "batch_id": batch_id,
+        "group_count": len(groups),
+        "objectives": {
+            "high_pair_count": high_count,
+            "medium_pair_count": medium_count,
+            "max_three_prime_run": max_three,
+        },
+        "selected": [
+            {
+                "group_index": group_index,
+                "position": position,
+                "name": name_by_position[position],
+            }
+            for group_index, position in enumerate(selected)
+        ],
+        "pairs": [db.serialize_pair(row) for row in risky_rows],
     }

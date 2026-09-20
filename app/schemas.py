@@ -761,3 +761,84 @@ class BatchSeriesRiskTrajectoriesOut(BaseModel):
     trajectories: list[RiskTrajectoryOut] = Field(
         description="仅含发生风险/存在性/序列变化的轨迹，按配对键升序"
     )
+
+
+class PanelSelectionGroupIn(BaseModel):
+    """一个目标组：面板从该组候选中恰选一条引物。"""
+
+    primer_names: list[str] = Field(
+        ...,
+        min_length=2,
+        max_length=5,
+        description="2～5 个批次内引物名称（组内有序、跨组不可重复）",
+    )
+
+    @field_validator("primer_names")
+    @classmethod
+    def _primer_names(cls, values: list[str]) -> list[str]:
+        normalized: list[str] = []
+        for value in values:
+            name = value.strip()
+            if not name:
+                raise ValueError("引物名称不能为空")
+            if len(name) > 100:
+                raise ValueError("引物名称最长 100 字符")
+            normalized.append(name)
+        return normalized
+
+
+class PanelSelectionRequest(BaseModel):
+    groups: list[PanelSelectionGroupIn] = Field(
+        ...,
+        min_length=2,
+        max_length=8,
+        description="2～8 个目标组（顺序即同分决胜时的组序），每组恰选一条引物",
+    )
+
+    @model_validator(mode="after")
+    def _check_unique_names(self) -> "PanelSelectionRequest":
+        seen: set[str] = set()
+        duplicates: list[str] = []
+        for group in self.groups:
+            for name in group.primer_names:
+                if name in seen and name not in duplicates:
+                    duplicates.append(name)
+                seen.add(name)
+        if duplicates:
+            raise ValueError("引物重复归组: " + ", ".join(duplicates))
+        return self
+
+
+class PanelSelectionObjectivesOut(BaseModel):
+    high_pair_count: int = Field(
+        description="面板内 high 配对数（第一目标，越小越优）"
+    )
+    medium_pair_count: int = Field(
+        description="面板内 medium 配对数（第二目标，越小越优）"
+    )
+    max_three_prime_run: int = Field(
+        description="面板全部配对（含 low）的最大 3′连续互补长度（第三目标，越小越优）"
+    )
+
+
+class PanelSelectionPrimerOut(BaseModel):
+    group_index: int = Field(description="目标组在请求中的序号（0 起）")
+    position: int = Field(description="入选引物在批次中的位置（0 起）")
+    name: str
+
+
+class PanelSelectionOut(BaseModel):
+    batch_id: str
+    group_count: int = Field(description="目标组数（2～8）")
+    objectives: PanelSelectionObjectivesOut = Field(
+        description="按字典序依次最小化的三元目标值"
+    )
+    selected: list[PanelSelectionPrimerOut] = Field(
+        description="各组入选引物（按组序，每组恰一条）"
+    )
+    pairs: list[PairOut] = Field(
+        description=(
+            "面板内全部 high/medium 配对（入选引物自二聚体与两两异二聚体，"
+            "按 pair_index 升序），与批次配对结果字段同构"
+        )
+    )

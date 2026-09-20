@@ -26,3 +26,7 @@ RESET_ON_START: bool = _env_bool("PRIMER_DB_RESET", "0")
 # 阈值起止范围 1～200，单次请求的阈值组合数不超过 40000
 THRESHOLD_MAP_MAX_THRESHOLD: int = 200
 THRESHOLD_MAP_MAX_CELLS: int = 40000
+
+# 多重 PCR 面板联合选择的搜索组合数上限（接口规格，非部署可调）：
+# 2～8 个目标组 × 每组 2～5 条候选，组合数上界恰为 5^8
+PANEL_SELECTION_MAX_COMBINATIONS: int = 390625

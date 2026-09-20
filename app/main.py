@@ -24,6 +24,8 @@ from .schemas import (
     ConflictRepairPlanOut,
     ConflictRepairRequest,
     PairOut,
+    PanelSelectionOut,
+    PanelSelectionRequest,
     PoolPlanOut,
     PoolPlanRequest,
     PrimerOut,
@@ -40,6 +42,7 @@ from .services import (
     compare_batches,
     plan_batch_augmentation,
     plan_batch_conflict_repair,
+    plan_batch_panel_selection,
     plan_batch_pools,
     rank_replacements,
     run_batch,
@@ -361,6 +364,31 @@ def create_threshold_map(
     if result is None:
         raise HTTPException(status_code=404, detail="批次不存在")
     return ThresholdMapOut(**result)
+
+
+@app.post(
+    "/api/batches/{batch_id}/panel-selection",
+    tags=["batches"],
+    summary="为已保存批次联合选择多重 PCR 面板（分支限界精确解，不重算对齐、不写库）",
+    response_model=PanelSelectionOut,
+    responses={
+        404: {"description": "批次不存在"},
+        422: {"description": "引物名称非法、重复归组或搜索组合数超限"},
+    },
+)
+def create_panel_selection(
+    batch_id: str, payload: PanelSelectionRequest
+) -> PanelSelectionOut:
+    try:
+        result = plan_batch_panel_selection(
+            batch_id=batch_id,
+            groups=[group.primer_names for group in payload.groups],
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    if result is None:
+        raise HTTPException(status_code=404, detail="批次不存在")
+    return PanelSelectionOut(**result)
 
 
 @app.post(
